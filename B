@@ -1,0 +1,224 @@
+import argparse
+import re
+from pathlib import Path
+
+import pandas as pd
+import argostranslate.package
+import argostranslate.translate
+
+
+# ─── Map locale (e.g. ".fr-CH") -> Argos language code (e.g. "fr") ─────────
+def locale_to_lang(header: str) -> str | None:
+    """
+    '.en-US' -> 'en'
+    """
+    if not isinstance(header, str):
+        return None
+    h = header.strip().lstrip(".")
+    if not h:
+        return None
+    # Take the part before the dash/underscore
+    base = re.split(r"[-_]", h)[0].lower()
+    return base if len(base) == 2 else None
+
+
+# ─── Translation model installation ────────────────────────────────────────
+def install_package(from_code: str, to_code: str) -> None:
+    """Download and install a translation model if it is not present yet."""
+    argostranslate.package.update_package_index()
+    available = argostranslate.package.get_available_packages()
+    pkg = next(
+        (p for p in available if p.from_code == from_code and p.to_code == to_code),
+        None,
+    )
+    if pkg is None:
+        raise RuntimeError(f"No model available for {from_code} -> {to_code}")
+    argostranslate.package.install_from_path(pkg.download())
+
+
+def ensure_language_installed(from_code: str, to_code: str) -> None:
+    """Make sure the model for the given language pair is installed."""
+    installed = argostranslate.translate.get_installed_languages()
+    from_lang = next((l for l in installed if l.code == from_code), None)
+    if from_lang is None:
+        install_package(from_code, to_code)
+        return
+    to_lang = next(
+        (t for t in from_lang.translations_to if t.to_lang.code == to_code), None
+    )
+    if to_lang is None:
+        install_package(from_code, to_code)
+
+
+def translate_text(text: str, from_code: str, to_code: str) -> str:
+    """Translate a single string. Returns the input unchanged if empty."""
+    if not isinstance(text, str) or not text.strip():
+        return text
+    if from_code == to_code:
+        return text
+    ensure_language_installed(from_code, to_code)
+    return argostranslate.translate.translate(text, from_code, to_code)
+
+
+# ─── Main logic ────────────────────────────────────────────────────────────
+def translate_excel(
+    input_path: str,
+    output_path: str,
+    source_header: str,
+    target_headers: list[str] | None,
+    sheet_name: str | int = 0,
+    overwrite: bool = False,
+) -> None:
+    df = pd.read_excel(input_path, sheet_name=sheet_name)
+
+    # Normalize headers – strip whitespace
+    df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
+
+    if source_header not in df.columns:
+        raise ValueError(
+            f"Source column '{source_header}' not found. "
+            f"Available columns: {list(df.columns)}"
+        )
+
+    source_lang = locale_to_lang(source_header)
+    if source_lang is None:
+        raise ValueError(
+            f"Could not detect a language code from source header: '{source_header}'"
+        )
+
+    # If the user did not pass target columns, auto-detect all "." columns
+    if not target_headers:
+        target_headers = [
+            c
+            for c in df.columns
+            if isinstance(c, str)
+            and c.startswith(".")
+            and c != source_header
+        ]
+        if not target_headers:
+            raise ValueError(
+                "No target columns found (expected headers like '.fr-FR')."
+            )
+
+    print(f"Source: {source_header}  (lang: {source_lang})")
+    print(f"Targets: {', '.join(target_headers)}\n")
+
+    stats = {}
+
+    for header in target_headers:
+        target_lang = locale_to_lang(header)
+        if target_lang is None:
+            print(f" Skipping column '{header}' – cannot detect language code.")
+            continue
+
+        # Create the target column if it does not exist
+        if header not in df.columns:
+            df[header] = pd.NA
+
+        translated_count = 0
+        skipped_count = 0
+        empty_source = 0
+
+        # Cache – do not translate the same string twice
+        cache: dict[str, str] = {}
+
+        for idx, row in df.iterrows():
+            source_value = row[source_header]
+            existing_value = row[header]
+
+            # Empty source – skip
+            if not isinstance(source_value, str) or not source_value.strip():
+                empty_source += 1
+                continue
+
+            # Already translated – skip (unless overwrite=True)
+            if (
+                not overwrite
+                and pd.notna(existing_value)
+                and str(existing_value).strip() != ""
+            ):
+                skipped_count += 1
+                continue
+
+            # Translate (with cache)
+            if source_value not in cache:
+                try:
+                    cache[source_value] = translate_text(
+                        source_value, source_lang, target_lang
+                    )
+                except Exception as e:
+                    print(f" Translation error for '{source_value[:40]}...': {e}")
+                    cache[source_value] = source_value  # fallback: keep original
+            df.at[idx, header] = cache[source_value]
+            translated_count += 1
+
+        stats[header] = {
+            "lang": target_lang,
+            "translated": translated_count,
+            "skipped (already filled)": skipped_count,
+            "empty source": empty_source,
+        }
+
+    df.to_excel(output_path, index=False)
+
+    print(f"\n Saved: {output_path}\n")
+    print("Statistics:")
+    for col, s in stats.items():
+        print(
+            f"  • {col} [{s['lang']}]: "
+            f"translated {s['translated']}, "
+            f"skipped {s['skipped (already filled)']}, "
+            f"empty source {s['empty source']}"
+        )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Local Excel translation (offline). Headers use locale format, e.g. .en-US, .fr-FR."
+    )
+    parser.add_argument("input", help="Path to the .xlsx file")
+    parser.add_argument(
+        "-o", "--output", default=None, help="Output file (default: *_translated.xlsx)"
+    )
+    parser.add_argument(
+        "-c",
+        "--column",
+        default=".en-US",
+        help="Source column header (default: .en-US)",
+    )
+    parser.add_argument(
+        "-t",
+        "--targets",
+        nargs="+",
+        default=None,
+        help="Target column headers, e.g. -t .fr-FR .it-IT. "
+             "If omitted, all columns starting with '.' are auto-detected.",
+    )
+    parser.add_argument("--sheet", default=0, help="Sheet name or index (default: 0)")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing translations (default: do NOT overwrite)",
+    )
+    args = parser.parse_args()
+
+    input_path = Path(args.input)
+    if not input_path.exists():
+        raise SystemExit(f"File does not exist: {input_path}")
+
+    output_path = args.output or str(
+        input_path.with_name(input_path.stem + "_translated" + input_path.suffix)
+    )
+
+    translate_excel(
+        input_path=str(input_path),
+        output_path=output_path,
+        source_header=args.column,
+        target_headers=args.targets,
+        sheet_name=args.sheet,
+        overwrite=args.overwrite,
+    )
+
+
+if __name__ == "__main__":
+    main()
