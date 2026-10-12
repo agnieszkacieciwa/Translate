@@ -1,0 +1,185 @@
+import argparse
+from pathlib import Path
+
+import pandas as pd
+import argostranslate.package
+import argostranslate.translate
+
+
+# Mapowanie kodów języków na nazwy kolumn w Excelu
+LANG_TO_COLUMN = {
+    "pl": "Polski",
+    "de": "Deutsch",
+    "fr": "Francais",
+    "es": "Espanol",
+    "it": "Italiano",
+    "pt": "Portugues",
+    "nl": "Nederlands",
+    "ru": "Russkiy",
+    "uk": "Ukrainska",
+    "cs": "Cestina",
+    "sk": "Slovencina",
+    "hu": "Magyar",
+    "ro": "Romana",
+    "tr": "Turkce",
+    "zh": "Chinese",
+}
+
+
+def install_package(from_code: str, to_code: str) -> None:
+    """Pobiera i instaluje model tłumaczeniowy, jeśli go nie ma."""
+    argostranslate.package.update_package_index()
+    available = argostranslate.package.get_available_packages()
+    pkg = next(
+        (p for p in available if p.from_code == from_code and p.to_code == to_code),
+        None,
+    )
+    if pkg is None:
+        raise RuntimeError(f"Brak modelu {from_code} -> {to_code}")
+    argostranslate.package.install_from_path(pkg.download())
+
+
+def ensure_language_installed(from_code: str, to_code: str) -> None:
+    installed = argostranslate.translate.get_installed_languages()
+    from_lang = next((l for l in installed if l.code == from_code), None)
+    if from_lang is None:
+        install_package(from_code, to_code)
+        return
+    to_lang = next(
+        (t for t in from_lang.translations_to if t.to_lang.code == to_code), None
+    )
+    if to_lang is None:
+        install_package(from_code, to_code)
+
+
+def translate_text(text: str, from_code: str, to_code: str) -> str:
+    if not isinstance(text, str) or not text.strip():
+        return text
+    ensure_language_installed(from_code, to_code)
+    return argostranslate.translate.translate(text, from_code, to_code)
+
+
+def translate_excel(
+    input_path: str,
+    output_path: str,
+    source_column: str,
+    source_lang: str,
+    target_langs: list[str],
+    sheet_name: str | int = 0,
+    overwrite: bool = False,
+) -> None:
+    df = pd.read_excel(input_path, sheet_name=sheet_name)
+
+    if source_column not in df.columns:
+        raise ValueError(
+            f"Kolumna '{source_column}' nie istnieje. Dostępne: {list(df.columns)}"
+        )
+
+    stats = {}
+
+    for lang in target_langs:
+        col_name = LANG_TO_COLUMN.get(lang, lang.upper())
+
+        # Utwórz kolumnę docelową, jeśli nie istnieje
+        if col_name not in df.columns:
+            df[col_name] = pd.NA
+
+        translated_count = 0
+        skipped_count = 0
+        empty_source = 0
+
+        # Cache – ten sam tekst nie jest tłumaczony dwa razy
+        cache: dict[str, str] = {}
+
+        for idx, row in df.iterrows():
+            source_value = row[source_column]
+            existing_value = row[col_name]
+
+            # Puste źródło – pomiń
+            if not isinstance(source_value, str) or not source_value.strip():
+                empty_source += 1
+                continue
+
+            # Już przetłumaczone – pomiń (chyba że overwrite=True)
+            if (
+                not overwrite
+                and pd.notna(existing_value)
+                and str(existing_value).strip() != ""
+            ):
+                skipped_count += 1
+                continue
+
+            # Tłumacz (z cache)
+            if source_value not in cache:
+                cache[source_value] = translate_text(source_value, source_lang, lang)
+            df.at[idx, col_name] = cache[source_value]
+            translated_count += 1
+
+        stats[col_name] = {
+            "przetłumaczono": translated_count,
+            "pominięto (już było)": skipped_count,
+            "puste źródło": empty_source,
+        }
+
+    df.to_excel(output_path, index=False)
+
+    print(f"\n✅ Zapisano: {output_path}\n")
+    print("📊 Statystyki:")
+    for col, s in stats.items():
+        print(
+            f"  • {col}: przetłumaczono {s['przetłumaczono']}, "
+            f"pominięto {s['pominięto (już było)']}, "
+            f"puste źródło {s['puste źródło']}"
+        )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Lokalne tłumaczenie kolumny Excel (offline, bez nadpisywania istniejących tłumaczeń)."
+    )
+    parser.add_argument("input", help="Ścieżka do pliku .xlsx")
+    parser.add_argument(
+        "-o", "--output", default=None, help="Plik wyjściowy (domyślnie: *_translated.xlsx)"
+    )
+    parser.add_argument(
+        "-c", "--column", default="English", help="Kolumna źródłowa (domyślnie: English)"
+    )
+    parser.add_argument(
+        "-s", "--source-lang", default="en", help="Kod języka źródłowego (domyślnie: en)"
+    )
+    parser.add_argument(
+        "-t",
+        "--targets",
+        nargs="+",
+        default=["pl"],
+        help="Kody języków docelowych, np. -t pl de fr",
+    )
+    parser.add_argument("--sheet", default=0, help="Nazwa/indeks arkusza (domyślnie: 0)")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Nadpisz istniejące tłumaczenia (domyślnie: NIE nadpisuje)",
+    )
+    args = parser.parse_args()
+
+    input_path = Path(args.input)
+    if not input_path.exists():
+        raise SystemExit(f"Plik nie istnieje: {input_path}")
+
+    output_path = args.output or str(
+        input_path.with_name(input_path.stem + "_translated" + input_path.suffix)
+    )
+
+    translate_excel(
+        input_path=str(input_path),
+        output_path=output_path,
+        source_column=args.column,
+        source_lang=args.source_lang,
+        target_langs=args.targets,
+        sheet_name=args.sheet,
+        overwrite=args.overwrite,
+    )
+
+
+if __name__ == "__main__":
+    main()
